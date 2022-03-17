@@ -1,8 +1,9 @@
 import originalUrl from 'original-url'
-import { hydra }   from '@oryd/hydra-client'
 import { format }  from 'url'
 
 export const signup = register => async (req, res) => {
+  const { hydra } = req
+
   const result: any = await register(req.body)
 
   if (result.errors) {
@@ -17,7 +18,7 @@ export const signup = register => async (req, res) => {
       const acceptLoginRequest = await hydra.acceptLoginRequest(challenge, {
         subject: result.result.id,
         remember: true,
-        remember_for: 3600,
+        rememberFor: 3600,
         context: result.result,
       })
 

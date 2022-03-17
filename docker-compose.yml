@@ -2,12 +2,11 @@ version: '3.7'
 
 services:
   traefik:
-    image: aunited/traefik:sy
+    image: atlantislab/traefik:serenity
     command: --api --docker
     ports:
       - 80:80
       - 443:443
-      - 8080:8080
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
     networks:
@@ -16,7 +15,7 @@ services:
         ipv4_address: 172.16.101.99
 
   yarn:
-    image: node:14-alpine
+    image: node:13.7-alpine
     working_dir: /workspace
     volumes:
       - ./:/workspace
@@ -26,39 +25,234 @@ services:
       - YARN_CACHE_FOLDER=/workspace/.yarn-cache
     entrypoint: yarn
 
-  identity:
-    image: node:14-alpine
+  mailhog:
+    image: mailhog/mailhog
+    logging:
+      driver: none
+    ports:
+      - 8025:8025
+
+  redis:
+    image: redis
+
+  rabbitmq:
+    build:
+      context: ./config/rabbitmq/
+      dockerfile: ./Dockerfile
+    ports:
+      - 4369:4369
+      - 5671:5671
+      - 5672:5672
+      - 15672:15672
+    environment:
+      - RABBITMQ_DEFAULT_USER=local
+      - RABBITMQ_DEFAULT_PASS=password
+
+  s3:
+    image: minio/minio
+    volumes:
+      - ./.data:/data
+    environment:
+      - MINIO_ACCESS_KEY=accesskey
+      - MINIO_SECRET_KEY=secretkey
+    command: server data
+    labels:
+      - 'traefik.frontend.rule=Host:s3.serenity.local.aunited.dev'
+      - 'traefik.protocol=http'
+      - 'traefik.port=9000'
+    depends_on:
+      - traefik
+    networks:
+      - default
+      - traefik
+
+  db:
+    image: bitnami/postgresql
+    environment:
+      - POSTGRESQL_PASSWORD=password
+      - POSTGRESQL_DATABASE=db
+
+  hydra-migrate:
+    image: oryd/hydra:v1.6.0
+    environment:
+      - DSN=postgres://postgres:password@db:5432/db?sslmode=disable&max_conns=20&max_idle_conns=4
+    command: migrate sql -e --yes
+    restart: on-failure
+
+  oathkeeper-migrate:
+    image: oryd/oathkeeper:v0.38.2-beta.1
+    environment:
+      - DSN=postgres://postgres:password@db:5432/db?sslmode=disable&max_conns=20&max_idle_conns=4
+    command: migrate sql -e --yes
+    restart: on-failure
+
+  hydra-configure:
+    image: oryd/hydra:v1.6.0
+    environment:
+      - HYDRA_ADMIN_URL=http://hydra:4445
+    volumes:
+      - ./config/ory:/config
+    command: clients import --skip-tls-verify /config/hydra/clients/public-app.json
+    restart: on-failure
+
+  hydra:
+    image: oryd/hydra:v1.6.0
+    command: serve all --skip-tls-verify --dangerous-force-http
+    environment:
+      - LOG_LEVEL=trace
+      - URLS_SELF_ISSUER=https://sso.serenity.local.aunited.dev
+      - URLS_CONSENT=https://accounts.serenity.local.aunited.dev/consent
+      - URLS_LOGIN=https://accounts.serenity.local.aunited.dev/
+      - URLS_LOGOUT=https://accounts.serenity.local.aunited.dev/signout
+      - URLS_POST_LOGOUT_REDIRECT=https://accounts.serenity.local.aunited.dev/signout/complete
+      - URL_POST_LOGOUT_REDIRECT=https://accounts.serenity.local.aunited.dev/signout
+      - SECRETS_SYSTEM=supersecretvalue
+      - OIDC_SUBJECT_IDENTIFIERS_PAIRWISE_SALT=supersecretvalue
+      - OIDC_SUBJECT_IDENTIFIERS_ENABLED=public,pairwise
+      - DSN=postgres://postgres:password@db:5432/db?sslmode=disable&max_conns=20&max_idle_conns=4
+    restart: unless-stopped
+    labels:
+      - 'traefik.frontend.rule=Host:sso.serenity.local.aunited.dev'
+      - 'traefik.protocol=http'
+      - 'traefik.port=4444'
+    depends_on:
+      - hydra-configure
+      - hydra-migrate
+      - traefik
+      - db
+    networks:
+      - default
+      - traefik
+
+  oathkeeper:
+    image: oryd/oathkeeper:v0.38.2-beta.1
+    command: serve serve --config /config/oathkeeper/config.yaml
+    volumes:
+      - ./config/ory:/config
+    environment:
+      - DATABASE_URL=postgres://postgres:password@db:5432/db?sslmode=disable&max_conns=20&max_idle_conns=4
+    restart: unless-stopped
+    labels:
+      - 'traefik.site.frontend.rule=Host:serenity.local.aunited.dev'
+      - 'traefik.admin.frontend.rule=Host:admin.serenity.local.aunited.dev'
+      - 'traefik.cabinet.frontend.rule=Host:cabinet.serenity.local.aunited.dev'
+      - 'traefik.public_gateway.frontend.rule=Host:public-gateway.serenity.local.aunited.dev'
+      - 'traefik.private_gateway.frontend.rule=Host:private-gateway.serenity.local.aunited.dev'
+      - 'traefik.port=4455'
+    depends_on:
+      - oathkeeper-migrate
+      - cookie-store
+      - traefik
+      - db
+    networks:
+      - default
+      - traefik
+
+  accounts:
+    image: node:13.7-alpine
     working_dir: /workspace
     volumes:
       - ./:/workspace
       - modules:/workspace/node_modules
-    entrypoint: yarn run identity:dev
-    depends_on:
-      - db
-    ports:
-      - 3002:50051
-
-  db:
-    image: postgres:11-alpine
-    restart: always
+    entrypoint: yarn accounts:dev
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: db
-    ports:
-      - 3001:5432
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
+      - OAUTH_AUTHORIZATION_URL=https://sso.serenity.local.aunited.dev/oauth2/auth
+      - OAUTH_TOKEN_URL=https://sso.serenity.local.aunited.dev/oauth2/token
+      - OAUTH_USERINFO_URL=https://sso.serenity.local.aunited.dev/userinfo
+      - OAUTH_CALLBACK_URL=https://accounts.serenity.local.aunited.dev/callback
+      - OAUTH_CLIENT_ID=app
+      - OAUTH_CLIENT_SECRET=app-client-secret
+    labels:
+      - 'traefik.frontend.rule=Host:accounts.serenity.local.aunited.dev'
+      - 'traefik.protocol=http'
+      - 'traefik.port=3000'
+    depends_on:
+      - traefik
+      - hydra
+      - redis
+    networks:
+      - default
+      - traefik
+    extra_hosts:
+      - 'sso.serenity.local.aunited.dev:172.16.101.99'
+
+  cookie-store:
+    image: node:13.7-alpine
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - modules:/workspace/node_modules
+    entrypoint: yarn cookie-store:dev
+    environment:
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
+      - OAUTH_AUTHORIZATION_URL=https://sso.serenity.local.aunited.dev/oauth2/auth
+      - OAUTH_TOKEN_URL=https://sso.serenity.local.aunited.dev/oauth2/token
+      - OAUTH_USERINFO_URL=https://sso.serenity.local.aunited.dev/userinfo
+      - OAUTH_CALLBACK_URL=https://accounts.serenity.local.aunited.dev/callback
+      - OAUTH_CLIENT_ID=app
+      - OAUTH_CLIENT_SECRET=app-client-secret
+    depends_on:
+      - redis
+
+  email:
+    image: node:13.7-alpine
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - modules:/workspace/node_modules
+    entrypoint: yarn email:dev
+    environment:
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
+      - NODE_ICU_DATA=/workspace/node_modules/full-icu
+      - PUBLIC_GATEWAY_URL=${PUBLIC_GATEWAY_URL}
+      - WEB_VERSION_URL=https://email.serenity.local.aunited.dev/s
+      - ACCOUNTS_URL=https://accounts.serenity.local.aunited.dev
+    labels:
+      - 'traefik.frontend.rule=Host:email.serenity.local.aunited.dev'
+      - 'traefik.protocol=http'
+      - 'traefik.port=3000'
+    depends_on:
+      - traefik
+    networks:
+      - default
+      - traefik
 
   private-gateway:
-    image: node:14-alpine
+    image: node:13.7-alpine
     working_dir: /workspace
     volumes:
       - ./:/workspace
       - modules:/workspace/node_modules
     entrypoint: yarn run private-gateway:dev
     labels:
-      - 'traefik.frontend.rule=Host:private-gateway.sy.local.aunited.dev'
+      - 'traefik.frontend.rule=Host:private-gateway.serenity.local.aunited.dev'
       - 'traefik.protocol=http'
       - 'traefik.port=3000'
+
+  identity-service:
+    image: node:13.7-alpine
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - modules:/workspace/node_modules
+    entrypoint: yarn identity:dev
+    depends_on:
+      - rabbitmq
+      - db
+
+  mailer-service:
+    image: node:13.7-alpine
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace
+      - modules:/workspace/node_modules
+    entrypoint: yarn mailer:dev
+    depends_on:
+      - rabbitmq
+      - mailhog
+      - redis
+      - db
 
 volumes:
   modules:
